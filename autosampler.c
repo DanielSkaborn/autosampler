@@ -65,6 +65,7 @@ typedef struct {
     int skip_existing;
     int sf2_only;
     int no_sf2;
+    int no_sfz;
     int dry_run;
     int extend; /* extend outermost key zones to 0 / 127 */
     double sf_release_ms;
@@ -769,6 +770,56 @@ static void gen(bbuf_t *b, int op, int amount)
     bb_u16(b, (uint32_t)(amount & 0xFFFF));
 }
 
+/*
+ * Computes key and velocity ranges for the np samples listed in pi[]
+ * (sorted by note, then velocity). Boundaries sit halfway between
+ * neighbouring sampled notes / velocities.
+ */
+static void compute_zones(const cfg_t *c, const sample_t *s, const int *pi,
+                          int np, int *klo, int *khi, int *vlo, int *vhi)
+{
+    int *gs = malloc(sizeof(int) * np), *ge = malloc(sizeof(int) * np);
+    if (!gs || !ge)
+        die("out of memory");
+    int ng = 0;
+    for (int k = 0; k < np;) {
+        int note = s[pi[k]].note, e = k;
+        while (e + 1 < np && s[pi[e + 1]].note == note)
+            e++;
+        gs[ng] = k;
+        ge[ng] = e;
+        ng++;
+        k = e + 1;
+    }
+    for (int g = 0; g < ng; g++) {
+        int n = s[pi[gs[g]]].note;
+        int pn = g > 0 ? s[pi[gs[g - 1]]].note : n;
+        int nn = g < ng - 1 ? s[pi[gs[g + 1]]].note : n;
+        int lo, hi;
+        if (g == 0)
+            lo = c->extend ? 0 : (ng > 1 ? n - (nn - n) / 2 : n);
+        else
+            lo = (pn + n) / 2 + 1;
+        if (g == ng - 1)
+            hi = c->extend ? 127 : (ng > 1 ? n + (n - pn) / 2 : n);
+        else
+            hi = (n + nn) / 2;
+        if (lo < 0) lo = 0;
+        if (hi > 127) hi = 127;
+        for (int k = gs[g]; k <= ge[g]; k++) {
+            klo[k] = lo;
+            khi[k] = hi;
+            int v = s[pi[k]].vel;
+            int pv = k > gs[g] ? s[pi[k - 1]].vel : v;
+            int nv = k < ge[g] ? s[pi[k + 1]].vel : v;
+            vlo[k] = (k == gs[g]) ? 1 : (pv + v) / 2 + 1;
+            vhi[k] = (k == ge[g]) ? 127 : (v + nv) / 2;
+        }
+    }
+    free(gs);
+    free(ge);
+}
+
 static int build_sf2(const cfg_t *c, sample_t *s, int ns, const char *path)
 {
     int *pi = malloc(sizeof(int) * (ns ? ns : 1));
@@ -828,44 +879,9 @@ static int build_sf2(const cfg_t *c, sample_t *s, int ns, const char *path)
     /* --- key / velocity zone computation --- */
     int *klo = malloc(sizeof(int) * np), *khi = malloc(sizeof(int) * np);
     int *vlo = malloc(sizeof(int) * np), *vhi = malloc(sizeof(int) * np);
-    int *gs = malloc(sizeof(int) * np), *ge = malloc(sizeof(int) * np);
-    if (!klo || !khi || !vlo || !vhi || !gs || !ge)
+    if (!klo || !khi || !vlo || !vhi)
         die("out of memory");
-    int ng = 0;
-    for (int k = 0; k < np;) {
-        int note = s[pi[k]].note, e = k;
-        while (e + 1 < np && s[pi[e + 1]].note == note)
-            e++;
-        gs[ng] = k;
-        ge[ng] = e;
-        ng++;
-        k = e + 1;
-    }
-    for (int g = 0; g < ng; g++) {
-        int n = s[pi[gs[g]]].note;
-        int pn = g > 0 ? s[pi[gs[g - 1]]].note : n;
-        int nn = g < ng - 1 ? s[pi[gs[g + 1]]].note : n;
-        int lo, hi;
-        if (g == 0)
-            lo = c->extend ? 0 : (ng > 1 ? n - (nn - n) / 2 : n);
-        else
-            lo = (pn + n) / 2 + 1;
-        if (g == ng - 1)
-            hi = c->extend ? 127 : (ng > 1 ? n + (n - pn) / 2 : n);
-        else
-            hi = (n + nn) / 2;
-        if (lo < 0) lo = 0;
-        if (hi > 127) hi = 127;
-        for (int k = gs[g]; k <= ge[g]; k++) {
-            klo[k] = lo;
-            khi[k] = hi;
-            int v = s[pi[k]].vel;
-            int pv = k > gs[g] ? s[pi[k - 1]].vel : v;
-            int nv = k < ge[g] ? s[pi[k + 1]].vel : v;
-            vlo[k] = (k == gs[g]) ? 1 : (pv + v) / 2 + 1;
-            vhi[k] = (k == ge[g]) ? 127 : (v + nv) / 2;
-        }
-    }
+    compute_zones(c, s, pi, np, klo, khi, vlo, vhi);
 
     double rel_s = c->sf_release_ms / 1000.0;
     if (rel_s < 0.001) rel_s = 0.001;
@@ -1029,8 +1045,78 @@ static int build_sf2(const cfg_t *c, sample_t *s, int ns, const char *path)
 
     free(info.p); free(tmp.p); free(pdta.p); free(ch_.p);
     free(ibag.p); free(igen.p);
-    free(klo); free(khi); free(vlo); free(vhi); free(gs); free(ge);
+    free(klo); free(khi); free(vlo); free(vhi);
     free(pi); free(pf);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* SFZ writer                                                          */
+/* ------------------------------------------------------------------ */
+
+/* sfz_path: path of the .sfz; sample paths are written relative to it. */
+static int build_sfz(const cfg_t *c, sample_t *s, int ns, const char *sfz_path,
+                     const char *sample_root)
+{
+    int *pi = malloc(sizeof(int) * (ns ? ns : 1));
+    int np = 0;
+    if (!pi)
+        die("out of memory");
+    for (int i = 0; i < ns; i++)
+        if (s[i].present)
+            pi[np++] = i;
+    if (np == 0) {
+        fprintf(stderr, "SFZ: no samples found, nothing to do\n");
+        free(pi);
+        return -1;
+    }
+    int *klo = malloc(sizeof(int) * np), *khi = malloc(sizeof(int) * np);
+    int *vlo = malloc(sizeof(int) * np), *vhi = malloc(sizeof(int) * np);
+    if (!klo || !khi || !vlo || !vhi)
+        die("out of memory");
+    compute_zones(c, s, pi, np, klo, khi, vlo, vhi);
+
+    FILE *f = fopen(sfz_path, "w");
+    if (!f) {
+        perror(sfz_path);
+        return -1;
+    }
+    size_t rootlen = strlen(sample_root);
+    double rel = c->sf_release_ms / 1000.0;
+
+    fprintf(f, "// %s - generated by autosampler " VERSION "\n", c->name);
+    fprintf(f, "// %d samples, note step %d, velocity step %d\n\n", np,
+            c->note_step, c->vel_step);
+    fprintf(f, "<global>\n"
+               "loop_mode=no_loop\n"
+               "ampeg_release=%.3f\n\n", rel);
+
+    int last_note = -1;
+    char nm[16];
+    for (int k = 0; k < np; k++) {
+        const sample_t *sm = &s[pi[k]];
+        if (sm->note != last_note) {
+            note_name(sm->note, 0, nm, sizeof nm);
+            fprintf(f, "// ---- %s (MIDI %d) ----\n", nm, sm->note);
+            fprintf(f, "<group>\nlokey=%d\nhikey=%d\npitch_keycenter=%d\n\n",
+                    klo[k], khi[k], sm->note);
+            last_note = sm->note;
+        }
+        const char *rp = sm->path;
+        if (!strncmp(rp, sample_root, rootlen)) {
+            rp += rootlen;
+            while (*rp == '/')
+                rp++;
+        }
+        fprintf(f, "<region>\nlovel=%d\nhivel=%d\nsample=", vlo[k], vhi[k]);
+        for (const char *p = rp; *p; p++) /* spaces are legal but fragile */
+            fputc(*p == '\\' ? '/' : *p, f);
+        fputc('\n', f);
+        fputc('\n', f);
+    }
+    int rc = fclose(f) == 0 ? 0 : -1;
+    printf("SFZ:       %s  (%d regions)\n", sfz_path, np);
+    free(klo); free(khi); free(vlo); free(vhi); free(pi);
     return rc;
 }
 
@@ -1145,9 +1231,10 @@ static void usage(void)
 "                            vel : one sub-folder per velocity layer\n"
 "                            note: one sub-folder per note\n"
 "  --skip-existing           don't re-record samples whose WAV already exists\n"
-"  --sf2-only                don't record; (re)build SF2 from existing WAVs\n"
+"  --sf2-only                don't record; (re)build SF2/SFZ from existing WAVs\n"
 "  --no-sf2                  don't generate the SoundFont\n"
-"  --sf-release MS           SF2 volume-envelope release (default 300)\n"
+"  --no-sfz                  don't generate the SFZ text file\n"
+"  --sf-release MS           SF2/SFZ envelope release (default 300)\n"
 "  --no-extend               don't stretch the outer key zones to 0 / 127\n"
 "  --dry-run                 print the sample plan and exit\n"
 "  -h, --help                show this help\n"
@@ -1163,7 +1250,7 @@ enum {
     OPT_NOTE_MIN, OPT_NOTE_MAX, OPT_NOTE_STEP, OPT_VEL_MIN, OPT_VEL_MAX,
     OPT_VEL_STEP, OPT_PREROLL, OPT_PAUSE, OPT_RATE, OPT_CHANNELS, OPT_BITS,
     OPT_GAIN, OPT_TRIM, OPT_THRESH, OPT_FADE, OPT_LATENCY, OPT_LAYOUT,
-    OPT_SKIP, OPT_SF2ONLY, OPT_NOSF2, OPT_SFREL, OPT_NOEXT, OPT_DRY
+    OPT_SKIP, OPT_SF2ONLY, OPT_NOSF2, OPT_NOSFZ, OPT_SFREL, OPT_NOEXT, OPT_DRY
 };
 
 static const struct option LONGOPTS[] = {
@@ -1182,7 +1269,7 @@ static const struct option LONGOPTS[] = {
     {"threshold", 1, 0, OPT_THRESH}, {"fade", 1, 0, OPT_FADE},
     {"latency", 1, 0, OPT_LATENCY}, {"layout", 1, 0, OPT_LAYOUT},
     {"skip-existing", 0, 0, OPT_SKIP}, {"sf2-only", 0, 0, OPT_SF2ONLY},
-    {"no-sf2", 0, 0, OPT_NOSF2}, {"sf-release", 1, 0, OPT_SFREL},
+    {"no-sf2", 0, 0, OPT_NOSF2}, {"no-sfz", 0, 0, OPT_NOSFZ}, {"sf-release", 1, 0, OPT_SFREL},
     {"no-extend", 0, 0, OPT_NOEXT}, {"dry-run", 0, 0, OPT_DRY},
     {0, 0, 0, 0}};
 
@@ -1271,6 +1358,7 @@ int main(int argc, char **argv)
         case OPT_SKIP: c.skip_existing = 1; break;
         case OPT_SF2ONLY: c.sf2_only = 1; break;
         case OPT_NOSF2: c.no_sf2 = 1; break;
+        case OPT_NOSFZ: c.no_sfz = 1; break;
         case OPT_SFREL: c.sf_release_ms = num("--sf-release", optarg, 1, 20000); break;
         case OPT_NOEXT: c.extend = 0; break;
         case OPT_DRY: c.dry_run = 1; break;
@@ -1312,9 +1400,10 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    char sdir[PATH_MAX], sf2path[PATH_MAX];
+    char sdir[PATH_MAX], sf2path[PATH_MAX], sfzpath[PATH_MAX];
     snprintf(sdir, sizeof sdir, "%s/%s", c.outdir, c.name);
     snprintf(sf2path, sizeof sf2path, "%s/%s.sf2", sdir, c.name);
+    snprintf(sfzpath, sizeof sfzpath, "%s/%s.sfz", sdir, c.name);
     if (mkdir_p(sdir) < 0) {
         perror(sdir);
         return 1;
@@ -1423,6 +1512,11 @@ int main(int argc, char **argv)
 
     if (!c.no_sf2 && !(g_stop && !c.sf2_only)) {
         if (build_sf2(&c, plan, ns, sf2path) < 0)
+            exit_code = 1;
+    }
+
+    if (!c.no_sfz && !(g_stop && !c.sf2_only)) {
+        if (build_sfz(&c, plan, ns, sfzpath, sdir) < 0)
             exit_code = 1;
     }
 
