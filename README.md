@@ -2,7 +2,7 @@
 
 Command-line MIDI autosampler for Linux (C, ALSA). It plays notes to a synth
 over MIDI, records the audio coming back, saves one WAV per note/velocity and
-builds an SF2 SoundFont that maps the whole set.
+builds an SF2 SoundFont and an SFZ text file that map the whole set.
 
 ## Build
 
@@ -40,6 +40,7 @@ Use `--dry-run` first to see the file list and estimated time.
     <outdir>/<name>/v<vel>/...                               (--layout vel)
     <outdir>/<name>/<note#>_<NoteName>/...                   (--layout note)
     <outdir>/<name>/<name>.sf2
+    <outdir>/<name>/<name>.sfz
     <outdir>/<name>/<name>_manifest.csv
 
 File names sort by note, then velocity (`MyPiano_060_C4_v096.wav`;
@@ -59,11 +60,20 @@ bit (`--bits`), mono or stereo, and carry the root key in a `smpl` chunk.
   when a key is let go (default 300 ms).
 * SF2 audio is always 16-bit.
 
+## SFZ
+
+`<name>.sfz` is a plain-text instrument that references the WAV files
+directly (paths relative to the .sfz, so keep the folder together). It uses
+the same key/velocity zones as the SF2: one `<group>` per sampled note
+(`lokey`, `hikey`, `pitch_keycenter`) containing one `<region>` per velocity
+layer (`lovel`, `hivel`, `sample`). Global settings: `loop_mode=no_loop` and
+`ampeg_release` from `--sf-release`. Use `--no-sfz` to skip it.
+
 ## Resuming / rebuilding
 
 * Ctrl-C stops cleanly (note-off + all-sound-off are sent).
 * `--skip-existing` continues an interrupted session or fills gaps.
-* `--sf2-only` rebuilds the SoundFont (with the same note/velocity/name/layout
+* `--sf2-only` rebuilds the SoundFont and SFZ (with the same note/velocity/name/layout
   options) from WAVs already on disk, no hardware needed.
 
 ## Notes
